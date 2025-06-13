@@ -723,6 +723,7 @@ default() ->
      {root, false},     % Allow running processes as root.
      {args, ""},        % Extra arguments that can be passed to port program
      {alarm, 12},
+     % {portexe_dir, priv}, % use code:priv_dir or custom path
      {portexe, noportexe},
      {user, ""},        % Run port program as this user
      {limit_users, []}]. % Restricted list of users allowed to run commands
@@ -736,28 +737,28 @@ default(portexe) ->
     Priv ->
       % Find all ports using wildcard for resiliency
       Bin = case filelib:wildcard("*/exec-port", Priv) of
-              [Port] ->
-                % Exactly one match, use it as is
-                Port;
-              [] ->
-                error_logger:warning_msg("No exec-port files found in Priv directory", []),
-                "";
-              Ports ->
-                % More than one match: try to find one matching system architecture
-                Arch = erlang:system_info(system_architecture),
-                MatchingPath = lists:filter(
-                  fun(Path) ->
-                    % Check if the Path contains Arch as a subdirectory component
-                    string:str(Path, Arch) > 0
-                  end,
-                  Ports),
-                case MatchingPath of
-                  [Match] -> Match;
-                  _ ->
-                    error_logger:warning_msg(
-                      "Multiple exec-port files found but none match architecture ~s", [Arch]),
-                    ""
-                end
+            [Port] ->
+              % Exactly one match, use it as is
+              Port;
+            [] ->
+              error_logger:warning_msg("No exec-port files found in Priv directory", []),
+              "";
+            Ports ->
+              % More than one match: try to find one matching system architecture
+              Arch = erlang:system_info(system_architecture),
+              MatchingPath = lists:filter(
+                fun(Path) ->
+                  % Check if the Path contains Arch as a subdirectory component
+                  string:str(Path, Arch) > 0
+                end,
+                Ports),
+              case MatchingPath of
+              [Match] -> Match;
+              _ ->
+                error_logger:warning_msg(
+                  "Multiple exec-port files found but none match architecture ~s", [Arch]),
+                ""
+              end
             end,
       % If found, join the priv/port path
       case Bin of
@@ -1557,64 +1558,497 @@ flush() ->
         []
     end.
 
+temp_dir() ->
+    case os:getenv("TEMP") of
+    false -> "/tmp";
+    Path  -> Path
+    end.
+
+temp_file() ->
+    Dir = temp_dir(),
+    {I1, I2, I3}  = erlang:timestamp(),
+    filename:join(Dir, io_lib:format("exec_temp_~w_~w_~w", [I1, I2, I3])).
+
+exec_test_() ->
+    {setup,
+        fun() ->
+            Opts =
+                case os:getenv("TEST_USER") of
+                    false -> [];
+                    User  ->
+                        [root, {limit_users, [User]}, {user, User}]
+                end,
+            Opts1 =
+                case os:getenv("PORT_DEBUG") of
+                    false -> Opts;
+                    _     -> [{debug, 1}, verbose | Opts]
+                end,
+            {ok, Pid} = exec:start(Opts1),
+            Pid
+        end,
+
+        fun(Pid) -> exit(Pid, kill) end,
+        [
+            ?tt(test_root()),
+            ?tt(test_monitor()),
+            ?tt(test_sync()),
+            ?tt(test_winsz()),
+            ?tt(test_stdin()),
+            ?tt(test_large_stdin()),
+            ?tt(test_stdin_eof()),
+            ?tt(test_std(stdout)),
+            ?tt(test_std(stderr)),
+            ?tt(test_cmd()),
+            ?tt(test_executable()),
+            ?tt(test_redirect()),
+            ?tt(test_redirect_stdin()),
+            ?tt(test_env()),
+            ?tt(test_kill_timeout()),
+            ?tt(test_setpgid()),
+            ?tt(test_pty()),
+            ?tt(test_pty_echo()),
+            ?tt(test_pty_opts()),
+            ?tt(test_dynamic_pty_opts())
+            % TODO: add new tests?
+        ]
+    }.
+
+exec_run_many_test_() ->
+    Level = case os:getenv("PORT_DEBUG") of
+                false -> 0;
+                _     -> 1
+            end,
+    Delay = case os:getenv("PID_SLEEP_SEC") of
+                false  -> 1000;
+                Y      -> list_to_integer(Y)*1000
+            end,
+    N     = case os:getenv("RUN_COUNT") of
+                false  -> 900;
+                X      -> list_to_integer(X)
+            end,
+    M     = N*2,
+    {setup,
+        fun()    -> {ok, Pid} = exec:start([{debug, Level}]), Pid end,
+        fun(Pid) -> exit(Pid, kill) end,
+        [
+            {timeout, 200,
+                ?_assertMatch({ok,[{io_ops,M},{success,N}]}, test_exec:run(N, 60000, Delay))}
+        ]
+    }.
+
+test_root() ->
+    case os:getenv("NO_ROOT_TESTS") of
+        false ->
+            ?AssertMatch({error, "Cannot specify effective user"++_},
+                         exec:start([{user, "xxxx"}, {limit_users, [yyyy]}])),
+            ?AssertMatch({error, "Cannot restrict users"++_},
+                         exec:start([{limit_users, [yyyy]}])),
+            ?AssertMatch({error, "Not allowed to run without restricting effective users"++_},
+                         exec:start([root, {user, "xxxx"}])),
+            ?AssertMatch({error, "Not allowed to run without providing effective user "++_},
+                         exec:start([root, {limit_users, [yyyy]}]));
+        _ ->
+            ok
+    end.
+
+test_monitor() ->
+    {ok, P, _} = exec:run("echo ok", [{stdout, null}, monitor]),
+    ?receivePattern({'DOWN', _, process, P, normal}, 5000).
+
+test_sync() ->
+    ?AssertMatch({ok, [{stdout, [<<"Test\n">>]}, {stderr, [<<"ERR\n">>]}]},
+        exec:run("echo Test; echo ERR 1>&2", [stdout, stderr, sync])),
+    ?AssertMatch({ok,[{stdout,[<<"\n">>]}]},
+         exec:run([<<"/bin/echo">>], [sync, stdout])),
+    ?AssertMatch({ok,[{stdout,[<<"\n">>]}]},
+         exec:run(["/bin/echo"], [sync, stdout])).
+
+
+test_winsz() ->
+    {ok, P, I} = exec:run(
+        ["/bin/bash", "-i", "-c", "echo started; read x; echo LINES=$(tput lines) COLUMNS=$(tput cols)"],
+        [stdin, stdout, {stderr, stdout}, monitor, pty, {env, [{"TERM", "xterm"}]}]),
+    ?receiveBytes({stdout, I, <<"started\r\n">>}, 3000),
+    ok = exec:winsz(I, 99, 88),
+    ok = exec:send(I, <<"\n">>),
+    ?receiveBytes({stdout, I, <<"LINES=99 COLUMNS=88\r\n">>}, 3000),
+    ?receivePattern({'DOWN', _, process, P, normal}, 5000),
+    % can set size on run
+    {ok, P2, I2} = exec:run(
+        ["/bin/bash", "-i", "-c", "echo LINES=$(tput lines) COLUMNS=$(tput cols)\n"],
+        [stdin, stdout, {stderr, stdout}, monitor, pty, {env, [{"TERM", "xterm"}]}, {winsz, {99, 88}}]),
+    ?receiveBytes({stdout, I2, <<"LINES=99 COLUMNS=88\r\n">>}, 5000),
+    ?receivePattern({'DOWN', _, process, P2, normal}, 5000).
+
+test_stdin() ->
+    {ok, P, I} = exec:run("read x; echo \"Got: $x\"", [stdin, stdout, monitor]),
+    ok = exec:send(I, <<"Test data\n">>),
+    ?receiveBytes({stdout,I,<<"Got: Test data\n">>}, 3000),
+    ?receivePattern({'DOWN', _, process, P, normal}, 5000).
+
+test_large_stdin() ->
+    {ok, Pid, _} = exec:run("cat", [stdin, stdout, stderr]),
+    ?assertEqual(ok, exec:send(Pid, erlang:list_to_binary([A rem 250 || A <- lists:seq(1,65511)]))),
+    ?assertEqual(ok, exec:send(Pid, erlang:list_to_binary([A rem 250 || A <- lists:seq(1,256*1024)]))).
+
+test_stdin_eof() ->
+    case os:find_executable("tac") of
+    false ->
+        ok;
+    _ ->
+        {ok, P, I} = exec:run("tac", [stdin, stdout, monitor]),
+        [ok = exec:send(I, Data)
+         || Data <- [<<"foo\n">>, <<"bar\n">>, <<"baz\n">>, eof]],
+        ?receiveBytes({stdout,I,<<"baz\nbar\nfoo\n">>}, 3000),
+        ?receivePattern({'DOWN', _, process, P, normal}, 5000)
+    end.
+
+test_std(Stream) ->
+    Suffix = case Stream of
+             stderr -> " 1>&2";
+             stdout -> ""
+             end,
+    {ok, _, I} = exec:run("for i in 1 2; do echo TEST$i; sleep 0.05; done" ++ Suffix, [Stream]),
+    ?receiveBytes({Stream,I,<<"TEST1\n">>}, 5000),
+    ?receiveBytes({Stream,I,<<"TEST2\n">>}, 5000),
+
+    Filename = temp_file(),
+    try
+        ?AssertMatch({ok, []}, exec:run("echo Test"++Suffix, [{Stream, Filename}, sync])),
+        ?AssertMatch({ok, <<"Test\n">>}, file:read_file(Filename)),
+
+        ?AssertMatch({ok, []}, exec:run("echo Test"++Suffix, [{Stream, Filename}, sync])),
+        ?AssertMatch({ok, <<"Test\n">>}, file:read_file(Filename)),
+
+        ?AssertMatch({ok, []}, exec:run("echo Test2"++Suffix, [{Stream, Filename, [append]}, sync])),
+        ?AssertMatch({ok, <<"Test\nTest2\n">>}, file:read_file(Filename))
+
+    after
+        ?assertEqual(ok, file:delete(Filename))
+    end.
+
+test_cmd() ->
+    % Cmd given as string
+    ?AssertMatch(
+        {ok, [{stdout, [<<"ok\n">>]}]},
+        exec:run("/bin/echo ok", [sync, stdout])),
+    ?AssertMatch(
+        {ok, [{stdout, [<<"ok\n">>]}]},
+        exec:run(<<"/bin/echo ok">>, [sync, stdout])),
+    % Cmd given as list
+    ?AssertMatch(
+        {ok, [{stdout, [<<"ok\n">>]}]},
+        exec:run(["/bin/bash", "-c", "echo ok"], [sync, stdout])),
+    ?AssertMatch(
+        {ok, [{stdout, [<<"ok\n">>]}]},
+        exec:run([<<"/bin/bash">>, <<"-c">>, <<"echo ok">>], [sync, stdout])),
+    ?AssertMatch(
+        {ok, [{stdout, [<<"ok\n">>]}]},
+        exec:run(["/bin/echo", "ok"], [sync, stdout])).
+
+test_executable() ->
+    % Cmd given as string
+    ?AssertMatch(
+        [<<"Pid ", _/binary>>, <<" cannot execute '00kuku00': No such file or directory\n">>],
+        begin
+            Res = exec:run("ls", [sync, {executable, "00kuku00"}, stdout, stderr]),
+            {error,[{exit_status,256},{stderr, [E]}]} = Res,
+            binary:split(E, <<":">>)
+        end),
+
+    ?AssertMatch(
+        {ok, [{stdout,[<<"ok\n">>]}]},
+        exec:run("echo ok", [sync, {executable, "/bin/sh"}, stdout, stderr])),
+
+    ?AssertMatch(
+        {ok, [{stdout,[<<"ok\n">>]}]},
+        exec:run(<<"echo ok">>, [sync, {executable, <<"/bin/sh">>}, stdout, stderr])),
+
+    % Cmd given as list
+    ?AssertMatch(
+        {ok, [{stdout,[<<"ok\n">>]}]},
+        exec:run(["/bin/bash", "-c", "/bin/echo ok"],
+                 [sync, {executable, "/bin/sh"}, stdout, stderr])),
+    ?AssertMatch(
+        {ok, [{stdout,[<<"XYZ\n">>]}]},
+        exec:run(["/bin/echoXXXX abc", "XYZ"],
+                 [sync, {executable, "/bin/echo"}, stdout, stderr])),
+
+    % Cmd given as a unicode string
+    File = unicode:characters_to_binary(filename:join(temp_dir(), "тест-эрл")),
+    try
+        ok = file:write_file(File, "#!/bin/bash\necho ok\n"),
+        ok = file:change_mode(File, 8#755),
+        ?AssertMatch(
+           {ok, [{stdout,[<<"ok\n">>]}]},
+           exec:run(File, [sync, stdout, stderr])),
+        ?AssertMatch(
+           {ok, [{stdout,[<<"ok\n">>]}]},
+           exec:run([<<"/bin/bash">>, <<"-c">>, File], [sync, stdout, stderr]))
+    after
+        ok = file:delete(File)
+    end.
+
+test_redirect() ->
+    ?AssertMatch({ok,[{stderr,[<<"TEST1\n">>]}]},
+        exec:run("echo TEST1", [stderr, {stdout, stderr}, sync])),
+    ?AssertMatch({ok,[{stdout,[<<"TEST2\n">>]}]},
+        exec:run("echo TEST2 1>&2", [stdout, {stderr, stdout}, sync])),
+    ok.
+
+test_redirect_stdin() ->
+    ?AssertMatch("ttt\n",
+        os:cmd("echo ttt > /tmp/output.txt; cat /tmp/output.txt")),
+    ?AssertMatch({ok,[{stdout,[<<"ttt\n">>]}]},
+        exec:run("cat", [{stdin, "/tmp/output.txt"}, sync, stdout])),
+    ?AssertMatch({ok,[{stdout,[<<"ttt\n">>]}]},
+        exec:run("cat", [{stdin, <<"/tmp/output.txt">>}, sync, stdout])),
+    file:delete("/tmp/output.txt").
+
+test_env() ->
+    ?AssertMatch({ok, [{stdout, [<<"X-Y\n">>]}]},
+        exec:run("echo $XXX-$YYY", [stdout, {env, [{"XXX", "X"}, {<<"YYY">>, <<"Y">>}]}, sync])).
+
+test_kill_timeout() ->
+    %{ok, _OldDebug} = exec:debug(3),
+    {ok, P2, I2} = exec:run("trap 'echo Got signal' SIGTERM; sleep 15", [{kill_timeout, 1}, stdout, monitor]),
+    timer:sleep(200),
+    exec:stop(I2),
+    timer:sleep(50),
+    %exec:debug(_OldDebug),
+    ?receivePattern({'DOWN', I2, process, P2, normal}, 5000).
+
+test_setpgid() ->
+    % Cmd given as string
+    {ok, P0, P} = exec:run("sleep  1", [{group, 0}, kill_group, monitor]),
+    {ok, P1, _} = exec:run("sleep 15", [{group, P}, monitor]),
+    {ok, P2, _} = exec:run("sleep 15", [{group, P}, monitor]),
+    ?receivePattern({'DOWN',_,process, P0, normal}, 5000),
+    ?receivePattern({'DOWN',_,process, P1, {exit_status, 15}}, 5000),
+    ?receivePattern({'DOWN',_,process, P2, {exit_status, 15}}, 5000).
+
+test_pty() ->
+    ?AssertMatch({error,[{exit_status,256},{stdout,[<<"not a tty\n">>]}]},
+        exec:run("tty", [stdin, stdout, sync])),
+    ?assert(case exec:run("tty", [stdin, stdout, pty, sync]) of
+        {ok,[{stdout,[<<"/dev/pts/", _/binary>>|_]}]} ->
+            true;
+        % on macos, the pty has the format /dev/ttysXXX
+        {ok,[{stdout,[<<"/dev/ttys", _/binary>>|_]}]} ->
+            true;
+        _ -> false
+    end),
+    {ok, P, I} = exec:run("/bin/bash --norc -i", [stdin, stdout, pty, monitor]),
+    ok = exec:send(I, <<"echo ok\n">>),
+    receive
+    {stdout, I, <<"echo ok\r\n">>} ->
+        ?receiveBytes({stdout, I, <<"ok\r\n">>}, 1000);
+    {stdout, I, <<"ok\r\n">>} ->
+        ok
+    after 1000 ->
+        ?AssertMatch({stdout, I, <<"ok\r\n">>}, timeout)
+    end,
+    ok = exec:send(I, <<"exit\n">>),
+    ?receivePattern({'DOWN', _, process, P, normal}, 1000).
+
+test_pty_echo() ->
+    % without echo
+    {ok, _, I} = exec:run("echo started && cat", [
+        stdin,
+        stdout,
+        {stderr, stdout},
+        pty,
+        monitor
+    ]),
+    ?receiveBytes({stdout, I, <<"started\r\n">>}, 5000),
+    ok = exec:send(I, <<"test\n">>),
+    ?receiveBytes({stdout, I, <<"test\r\n">>}, 5000),
+    ok = exec:kill(I, 9),
+    % with echo
+    {ok, _, I2} = exec:run("echo started && cat", [
+        stdin,
+        stdout,
+        {stderr, stdout},
+        pty,
+        pty_echo,
+        monitor
+    ]),
+    ?receiveBytes({stdout, I2, <<"started\r\n">>}, 5000),
+    ok = exec:send(I2, <<"test\n">>),
+    ?receiveBytes({stdout, I2, <<"test\r\ntest\r\n">>}, 5000).
+
+test_pty_opts() ->
+    ?AssertMatch({error,[{exit_status,256},{stdout,[<<"not a tty\n">>]}]},
+        exec:run("tty", [stdin, stdout, sync])),
+    ?assert(case exec:run("tty", [stdin, stdout, {pty, []}, sync]) of
+        {ok,[{stdout,[<<"/dev/pts/", _/binary>>|_]}]} ->
+            true;
+        {ok,[{stdout,[<<"/dev/ttys", _/binary>>|_]}]} ->
+            true;
+        _ -> false
+    end),
+    % without echo
+    {ok, P, I} = exec:run("echo started && cat", [
+        stdin,
+        stdout,
+        {stderr, stdout},
+        {pty, [{echo, false}]},
+        monitor
+    ]),
+    ?receiveBytes({stdout, I, <<"started\r\n">>}, 5000),
+    ok = exec:send(I, <<"test\n">>),
+    ?receiveBytes({stdout, I, <<"test\r\n">>}, 5000),
+    ok = exec:kill(I, 9),
+    ?receivePattern({'DOWN', I, process, P, {exit_status, 9}}, 5000),
+    % with echo
+    {ok, P2, I2} = exec:run("echo started && cat", [
+        stdin,
+        stdout,
+        {stderr, stdout},
+        {pty, [{echo, true}]},
+        monitor
+    ]),
+    ?receiveBytes({stdout, I2, <<"started\r\n">>}, 5000),
+    ok = exec:send(I2, <<"test\n">>),
+    ?receiveBytes({stdout, I2, <<"test\r\ntest\r\n">>}, 5000),
+    % send ^C
+    ok = exec:send(I2, <<3>>),
+    ?receiveBytes({stdout, I2, <<"^C">>}, 1000),
+    ?receivePattern({'DOWN', I2, process, P2, {exit_status, 2}}, 5000),
+    % vintr test
+    {ok, P3, I3} = exec:run("echo started && cat", [
+        stdin,
+        stdout,
+        {stderr, stdout},
+        {pty, [{echo, true}, {vintr, 2}]},
+        monitor
+    ]),
+    ?receiveBytes({stdout, I3, <<"started\r\n">>}, 5000),
+    ok = exec:send(I3, <<"test">>),
+    ?receiveBytes({stdout, I3, <<"test">>}, 5000),
+    % send ^C (3), should not interrupt
+    ok = exec:send(I3, <<3>>),
+    ?receiveBytes({stdout, I3, <<"^C">>}, 5000),
+    % send ^B (2), should interrupt
+    ok = exec:send(I3, <<2>>),
+    ?receiveBytes({stdout, I3, <<"^B">>}, 5000),
+    ?receivePattern({'DOWN', I3, process, P3, {exit_status, 2}}, 5000),
+    % opts validation
+    ?AssertMatch(
+        {error,{invalid_pty_value,[{vintr,false},
+                                   {tty_op_ispeed,-1},
+                                   {invalid,1}]}},
+        exec:run("echo not ok", [
+            sync,
+            stdin,
+            stdout,
+            {pty, [
+                {echo, true},
+                {echoke, 0},
+                {echoe, false},
+                {vintr, false},
+                {verase, 13},
+                {tty_op_ispeed, -1},
+                {invalid, 1}
+            ]}])).
+
+test_dynamic_pty_opts() ->
+    % without echo
+    {ok, P, I} = exec:run("echo started && cat", [
+        stdin,
+        stdout,
+        {stderr, stdout},
+        pty,
+        monitor
+    ]),
+    ?receiveBytes({stdout, I, <<"started\r\n">>}, 5000),
+    ok = exec:send(I, <<"test\n">>),
+    ?receiveBytes({stdout, I, <<"test\r\n">>}, 5000),
+    ok = exec:send(I, <<2>>),
+    ok = exec:send(I, <<"\n">>),
+    ?receiveBytes({stdout, I, <<2, 13, 10>>}, 5000),
+    % change echo to 1, interrupt to ^B
+    ok = exec:pty_opts(I, [{echo, 1}, {vintr, 2}]),
+    % opts validation
+    ?AssertMatch(
+        {error,{invalid_pty_value,[{vintr,false},
+                                   {tty_op_ispeed,-1},
+                                   {invalid,1}]}},
+        exec:pty_opts(I, [
+            {echo, true},
+            {echoke, 0},
+            {echoe, false},
+            {vintr, false},
+            {verase, 13},
+            {tty_op_ispeed, -1},
+            {invalid, 1}
+        ])),
+    ok = exec:send(I, <<"test\n">>),
+    ?receiveBytes({stdout, I, <<"test\r\ntest\r\n">>}, 5000),
+    % send ^B
+    ok = exec:send(I, <<2>>),
+    ?receiveBytes({stdout, I, <<"^B">>}, 5000),
+    ?receivePattern({'DOWN', I, process, P, {exit_status, 2}}, 5000).
+
 default_portexe_no_priv_test_() ->
     Priv = code:priv_dir(erlexec),
     Renamed = Priv ++ "_bak",
     {setup,
      fun() ->
          case filelib:is_dir(Priv) of
-             true ->
-               file:rename(Priv, Renamed);
-             false -> ok
+         true -> file:rename(Priv, Renamed);
+         false -> ok
          end
      end,
      fun(_) ->
          case filelib:is_dir(Renamed) of
-             true -> file:rename(Renamed, Priv);
-             false -> ok
+         true -> file:rename(Renamed, Priv);
+         false -> ok
          end
      end,
      fun() ->
-       ?assert(not filelib:is_dir(Priv)),
-       ?assertMatch("", exec:default(portexe))
-       % After the fix, this can be removed:
-       % ?assert(lists:suffix("/priv/false", exec:default(portexe)))
+         without_error_logger(fun() ->
+             ?assert(not filelib:is_dir(Priv)),
+             ?assertMatch("", exec:default(portexe))
+         % TODO: after the fixes of this branch (after 2nd commit), this can be removed:
+         % ?assert(lists:suffix("/priv/false", exec:default(portexe)))
+                              end)
      end}.
 
 
 default_portexe_random_file_only_test_() ->
-  Priv = code:priv_dir(erlexec),
-  Renamed = Priv ++ "_bak",
-  RandomFile = filename:join(Priv, "random-file"),
-  ArchDir = filename:join(Priv, erlang:system_info(system_architecture)),
+    Priv = code:priv_dir(erlexec),
+    Renamed = Priv ++ "_bak",
+    RandomFile = filename:join(Priv, "random-file"),
+    ArchDir = filename:join(Priv, erlang:system_info(system_architecture)),
 
-  {setup,
-    fun() ->
-      % Rename real priv dir if exists
-      case filelib:is_dir(Priv) of
-        true -> file:rename(Priv, Renamed);
-        false -> ok
-      end,
-      ok = file:make_dir(Priv),
-      ok = file:write_file(RandomFile, <<>>),
-      ok = file:make_dir(ArchDir)
-    end,
-    fun(_) ->
-      file:delete(RandomFile),
-      file:del_dir(ArchDir),
-      file:del_dir(Priv),
-      case filelib:is_dir(Renamed) of
-        true -> file:rename(Renamed, Priv);
-        false -> ok
-      end
-    end,
-    fun() ->
-      {ok, Entries} = file:list_dir(Priv),
-      % Should include "random-file" and arch dir
-      ?assertEqual(lists:sort([ "random-file", erlang:system_info(system_architecture) ]), lists:sort(Entries)),
-      % Since no exec-port anywhere, should return empty string
-      ?assertEqual("", exec:default(portexe))
-    end}.
+    {setup,
+        fun() ->
+            % Rename real priv dir if exists
+            case filelib:is_dir(Priv) of
+                true -> file:rename(Priv, Renamed);
+                false -> ok
+            end,
+            ok = file:make_dir(Priv),
+            ok = file:write_file(RandomFile, <<>>),
+            ok = file:make_dir(ArchDir)
+        end,
+        fun(_) ->
+            file:delete(RandomFile),
+            file:del_dir(ArchDir),
+            file:del_dir(Priv),
+            case filelib:is_dir(Renamed) of
+                true -> file:rename(Renamed, Priv);
+                false -> ok
+            end
+        end,
+        fun() ->
+            without_error_logger(fun() ->
+                {ok, Entries} = file:list_dir(Priv),
+                ?assertEqual(lists:sort([ "random-file", erlang:system_info(system_architecture) ]), lists:sort(Entries)),
+                ?assertEqual("", exec:default(portexe))
+                                 end)
+        end}.
 
 default_portexe_no_execport_files_only_test_() ->
   Priv = code:priv_dir(erlexec),
@@ -1625,10 +2059,9 @@ default_portexe_no_execport_files_only_test_() ->
 
   {setup,
     fun() ->
-      % Rename real priv dir if exists
       case filelib:is_dir(Priv) of
-        true -> file:rename(Priv, Renamed);
-        false -> ok
+      true -> file:rename(Priv, Renamed);
+      false -> ok
       end,
       ok = file:make_dir(Priv),
       ok = file:make_dir(ArchDir),
@@ -1641,16 +2074,16 @@ default_portexe_no_execport_files_only_test_() ->
       file:del_dir(ArchDir),
       file:del_dir(Priv),
       case filelib:is_dir(Renamed) of
-        true -> file:rename(Renamed, Priv);
-        false -> ok
+      true -> file:rename(Renamed, Priv);
+      false -> ok
       end
     end,
     fun() ->
-      {ok, Entries} = file:list_dir(Priv),
-      % Should include "random-file" and arch dir
-      ?assertEqual([ "exec-port", "only-arch" ], lists:sort(Entries)),
-      % Since no exec-port anywhere, should return empty string
-      ?assertMatch("", exec:default(portexe))
+        without_error_logger(fun() ->
+            {ok, Entries} = file:list_dir(Priv),
+            ?assertEqual([ "exec-port", "only-arch" ], lists:sort(Entries)),
+            ?assertMatch("", exec:default(portexe))
+                             end)
     end}.
 
 default_portexe_portexec_file_only_test_() ->
@@ -1661,10 +2094,9 @@ default_portexe_portexec_file_only_test_() ->
 
   {setup,
     fun() ->
-      % Rename real priv dir if exists
       case filelib:is_dir(Priv) of
-        true -> file:rename(Priv, Renamed);
-        false -> ok
+      true -> file:rename(Priv, Renamed);
+      false -> ok
       end,
       ok = file:make_dir(Priv),
       ok = file:make_dir(ArchDir),
@@ -1675,16 +2107,16 @@ default_portexe_portexec_file_only_test_() ->
       file:del_dir(ArchDir),
       file:del_dir(Priv),
       case filelib:is_dir(Renamed) of
-        true -> file:rename(Renamed, Priv);
-        false -> ok
+      true -> file:rename(Renamed, Priv);
+      false -> ok
       end
     end,
     fun() ->
-      {ok, Entries} = file:list_dir(Priv),
-      % Should include "random-file" and arch dir
-      ?assertEqual([ "only-arch" ], Entries),
-      % Since no exec-port anywhere, should return empty string
-      ?assert(lists:suffix("/priv/only-arch/exec-port", exec:default(portexe)))
+        without_error_logger(fun() ->
+            {ok, Entries} = file:list_dir(Priv),
+            ?assertEqual([ "only-arch" ], Entries),
+            ?assert(lists:suffix("/priv/only-arch/exec-port", exec:default(portexe)))
+                             end)
     end}.
 
 default_portexe_portexec_files_only_test_() ->
@@ -1698,10 +2130,9 @@ default_portexe_portexec_files_only_test_() ->
 
   {setup,
     fun() ->
-      % Rename real priv dir if exists
       case filelib:is_dir(Priv) of
-        true -> file:rename(Priv, Renamed);
-        false -> ok
+      true -> file:rename(Priv, Renamed);
+      false -> ok
       end,
       ok = file:make_dir(Priv),
       ok = file:make_dir(ArchDir),
@@ -1716,18 +2147,16 @@ default_portexe_portexec_files_only_test_() ->
       file:del_dir(OtherArchDir),
       file:del_dir(Priv),
       case filelib:is_dir(Renamed) of
-        true -> file:rename(Renamed, Priv);
-        false -> ok
+      true -> file:rename(Renamed, Priv);
+      false -> ok
       end
     end,
     fun() ->
-      {ok, Entries} = file:list_dir(Priv),
-      % Should include "random-file" and arch dir
-      ?assertEqual(lists:sort([ erlang:system_info(system_architecture), "unknown-arch" ]), lists:sort(Entries)),
-      % Since no exec-port anywhere, should return empty string
-      % ?assertEqual("", exec:default(portexe)),
-      % ?assertEqual("", Arch),
-      ?assert(lists:suffix("/priv/" ++ Arch ++ "/exec-port", exec:default(portexe)))
+        without_error_logger(fun() ->
+            {ok, Entries} = file:list_dir(Priv),
+            ?assertEqual(lists:sort([ erlang:system_info(system_architecture), "unknown-arch" ]), lists:sort(Entries)),
+            ?assert(lists:suffix("/priv/" ++ Arch ++ "/exec-port", exec:default(portexe)))
+                             end)
     end}.
 
 default_portexe_empty_priv_dir_test_() ->
@@ -1737,22 +2166,31 @@ default_portexe_empty_priv_dir_test_() ->
   {setup,
     fun() ->
       case filelib:is_dir(Priv) of
-        true -> file:rename(Priv, Renamed);
-        false -> ok
+      true -> file:rename(Priv, Renamed);
+      false -> ok
       end,
       ok = file:make_dir(Priv)
     end,
     fun(_) ->
       file:del_dir(Priv),
       case filelib:is_dir(Renamed) of
-        true -> file:rename(Renamed, Priv);
-        false -> ok
+      true -> file:rename(Renamed, Priv);
+      false -> ok
       end
     end,
     fun() ->
-      Files = file:list_dir(Priv),
-      ?assertMatch({ok, []}, Files),
-      ?assertEqual("", exec:default(portexe))
+        without_error_logger(fun() ->
+            ?assertMatch({ok, []}, file:list_dir(Priv)),
+            ?assertEqual("", exec:default(portexe))
+                             end)
     end}.
+
+without_error_logger(Fun) ->
+    error_logger:tty(false),
+    try
+        Fun()
+    after
+        error_logger:tty(true)
+    end.
 
 -endif.

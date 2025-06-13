@@ -728,23 +728,43 @@ default() ->
      {limit_users, []}]. % Restricted list of users allowed to run commands
 %% @private
 default(portexe) ->
-    % Retrieve the Priv directory
-    case code:priv_dir(erlexec) of
+  % Retrieve the Priv directory
+  case code:priv_dir(erlexec) of
     {error, _} ->
-        error_logger:warning_msg("Priv directory not available", []),
-        "";
+      error_logger:warning_msg("Priv directory not available", []),
+      "";
     Priv ->
-        % Find all ports using wildcard for resiliency
-        Bin = case filelib:wildcard("*/exec-port", Priv) of
-            [Port] -> Port;
-            _      ->
+      % Find all ports using wildcard for resiliency
+      Bin = case filelib:wildcard("*/exec-port", Priv) of
+              [Port] ->
+                % Exactly one match, use it as is
+                Port;
+              [] ->
+                error_logger:warning_msg("No exec-port files found in Priv directory", []),
+                "";
+              Ports ->
+                % More than one match: try to find one matching system architecture
                 Arch = erlang:system_info(system_architecture),
-                Tail = filename:join([Arch, "exec-port"]),
-                os:find_executable(filename:join([Priv, Tail]))
-        end,
-        % Join the priv/port path
-        filename:join([Priv, Bin])
-    end;
+                MatchingPath = lists:filter(
+                  fun(Path) ->
+                    % Check if the Path contains Arch as a subdirectory component
+                    string:str(Path, Arch) > 0
+                  end,
+                  Ports),
+                case MatchingPath of
+                  [Match] -> Match;
+                  _ ->
+                    error_logger:warning_msg(
+                      "Multiple exec-port files found but none match architecture ~s", [Arch]),
+                    ""
+                end
+            end,
+      % If found, join the priv/port path
+      case Bin of
+        "" -> "";
+        _ -> filename:join([Priv, Bin])
+      end
+  end;
 default(valgrind) ->
     {{Y,M,D},{H,Mi,S}} = {date(), time()},
     Exe =
@@ -1537,18 +1557,6 @@ flush() ->
         []
     end.
 
-temp_dir() ->
-    case os:getenv("TEMP") of
-    false -> "/tmp";
-    Path  -> Path
-    end.
-
-temp_file() ->
-    Dir = temp_dir(),
-    {I1, I2, I3}  = erlang:timestamp(),
-    filename:join(Dir, io_lib:format("exec_temp_~w_~w_~w", [I1, I2, I3])).
-
-exec_test_() ->
 default_portexe_no_priv_test_() ->
     Priv = code:priv_dir(erlexec),
     Renamed = Priv ++ "_bak",
@@ -1568,7 +1576,183 @@ default_portexe_no_priv_test_() ->
      end,
      fun() ->
        ?assert(not filelib:is_dir(Priv)),
-       ?assert(lists:suffix("/priv/false", exec:default(portexe)))
+       ?assertMatch("", exec:default(portexe))
+       % After the fix, this can be removed:
+       % ?assert(lists:suffix("/priv/false", exec:default(portexe)))
      end}.
+
+
+default_portexe_random_file_only_test_() ->
+  Priv = code:priv_dir(erlexec),
+  Renamed = Priv ++ "_bak",
+  RandomFile = filename:join(Priv, "random-file"),
+  ArchDir = filename:join(Priv, erlang:system_info(system_architecture)),
+
+  {setup,
+    fun() ->
+      % Rename real priv dir if exists
+      case filelib:is_dir(Priv) of
+        true -> file:rename(Priv, Renamed);
+        false -> ok
+      end,
+      ok = file:make_dir(Priv),
+      ok = file:write_file(RandomFile, <<>>),
+      ok = file:make_dir(ArchDir)
+    end,
+    fun(_) ->
+      file:delete(RandomFile),
+      file:del_dir(ArchDir),
+      file:del_dir(Priv),
+      case filelib:is_dir(Renamed) of
+        true -> file:rename(Renamed, Priv);
+        false -> ok
+      end
+    end,
+    fun() ->
+      {ok, Entries} = file:list_dir(Priv),
+      % Should include "random-file" and arch dir
+      ?assertEqual(lists:sort([ "random-file", erlang:system_info(system_architecture) ]), lists:sort(Entries)),
+      % Since no exec-port anywhere, should return empty string
+      ?assertEqual("", exec:default(portexe))
+    end}.
+
+default_portexe_no_execport_files_only_test_() ->
+  Priv = code:priv_dir(erlexec),
+  Renamed = Priv ++ "_bak",
+  BinFile = filename:join(Priv, "exec-port"),
+  ArchDir = filename:join(Priv, "only-arch"),
+  RandomFile = filename:join(ArchDir, "random-file"),
+
+  {setup,
+    fun() ->
+      % Rename real priv dir if exists
+      case filelib:is_dir(Priv) of
+        true -> file:rename(Priv, Renamed);
+        false -> ok
+      end,
+      ok = file:make_dir(Priv),
+      ok = file:make_dir(ArchDir),
+      ok = file:write_file(BinFile, <<>>),
+      ok = file:write_file(RandomFile, <<>>)
+    end,
+    fun(_) ->
+      file:delete(BinFile),
+      file:delete(RandomFile),
+      file:del_dir(ArchDir),
+      file:del_dir(Priv),
+      case filelib:is_dir(Renamed) of
+        true -> file:rename(Renamed, Priv);
+        false -> ok
+      end
+    end,
+    fun() ->
+      {ok, Entries} = file:list_dir(Priv),
+      % Should include "random-file" and arch dir
+      ?assertEqual([ "exec-port", "only-arch" ], lists:sort(Entries)),
+      % Since no exec-port anywhere, should return empty string
+      ?assertMatch("", exec:default(portexe))
+    end}.
+
+default_portexe_portexec_file_only_test_() ->
+  Priv = code:priv_dir(erlexec),
+  Renamed = Priv ++ "_bak",
+  ArchDir = filename:join(Priv, "only-arch"),
+  BinFile = filename:join(ArchDir, "exec-port"),
+
+  {setup,
+    fun() ->
+      % Rename real priv dir if exists
+      case filelib:is_dir(Priv) of
+        true -> file:rename(Priv, Renamed);
+        false -> ok
+      end,
+      ok = file:make_dir(Priv),
+      ok = file:make_dir(ArchDir),
+      ok = file:write_file(BinFile, <<>>)
+    end,
+    fun(_) ->
+      file:delete(BinFile),
+      file:del_dir(ArchDir),
+      file:del_dir(Priv),
+      case filelib:is_dir(Renamed) of
+        true -> file:rename(Renamed, Priv);
+        false -> ok
+      end
+    end,
+    fun() ->
+      {ok, Entries} = file:list_dir(Priv),
+      % Should include "random-file" and arch dir
+      ?assertEqual([ "only-arch" ], Entries),
+      % Since no exec-port anywhere, should return empty string
+      ?assert(lists:suffix("/priv/only-arch/exec-port", exec:default(portexe)))
+    end}.
+
+default_portexe_portexec_files_only_test_() ->
+  Priv = code:priv_dir(erlexec),
+  Renamed = Priv ++ "_bak",
+  Arch = erlang:system_info(system_architecture),
+  ArchDir = filename:join(Priv, Arch),
+  OtherArchDir = filename:join(Priv, "unknown-arch"),
+  OtherBinFile = filename:join(OtherArchDir, "exec-port"),
+  BinFile = filename:join(ArchDir, "exec-port"),
+
+  {setup,
+    fun() ->
+      % Rename real priv dir if exists
+      case filelib:is_dir(Priv) of
+        true -> file:rename(Priv, Renamed);
+        false -> ok
+      end,
+      ok = file:make_dir(Priv),
+      ok = file:make_dir(ArchDir),
+      ok = file:make_dir(OtherArchDir),
+      ok = file:write_file(BinFile, <<>>),
+      ok = file:write_file(OtherBinFile, <<>>)
+    end,
+    fun(_) ->
+      file:delete(BinFile),
+      file:delete(OtherBinFile),
+      file:del_dir(ArchDir),
+      file:del_dir(OtherArchDir),
+      file:del_dir(Priv),
+      case filelib:is_dir(Renamed) of
+        true -> file:rename(Renamed, Priv);
+        false -> ok
+      end
+    end,
+    fun() ->
+      {ok, Entries} = file:list_dir(Priv),
+      % Should include "random-file" and arch dir
+      ?assertEqual(lists:sort([ erlang:system_info(system_architecture), "unknown-arch" ]), lists:sort(Entries)),
+      % Since no exec-port anywhere, should return empty string
+      % ?assertEqual("", exec:default(portexe)),
+      % ?assertEqual("", Arch),
+      ?assert(lists:suffix("/priv/" ++ Arch ++ "/exec-port", exec:default(portexe)))
+    end}.
+
+default_portexe_empty_priv_dir_test_() ->
+  Priv = code:priv_dir(erlexec),
+  Renamed = Priv ++ "_bak",
+
+  {setup,
+    fun() ->
+      case filelib:is_dir(Priv) of
+        true -> file:rename(Priv, Renamed);
+        false -> ok
+      end,
+      ok = file:make_dir(Priv)
+    end,
+    fun(_) ->
+      file:del_dir(Priv),
+      case filelib:is_dir(Renamed) of
+        true -> file:rename(Renamed, Priv);
+        false -> ok
+      end
+    end,
+    fun() ->
+      Files = file:list_dir(Priv),
+      ?assertMatch({ok, []}, Files),
+      ?assertEqual("", exec:default(portexe))
+    end}.
 
 -endif.
